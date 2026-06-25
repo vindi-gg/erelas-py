@@ -32,6 +32,7 @@ Configuration (env vars, or pass to ``Erelas(...)``):
     ERELAS_BASE_URL   default http://dev.erelas.lan
     ERELAS_API_KEY    required for group/name pings (not for key= pings)
     ERELAS_DEFAULT_GROUP   default group for name pings; override per-call with group= (optional)
+    ERELAS_ENVIRONMENT     environment tag shown on alerts, e.g. config('ENV') -> "production" (optional)
     ERELAS_ENABLED    set false to no-op every ping (tests / off-dashboard runs)
     ERELAS_ASYNC      set false to send synchronously (simpler in tests)
 """
@@ -49,7 +50,7 @@ from uuid import uuid4
 
 import requests
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["Erelas", "erelas", "slugify", "START", "OK", "FAIL"]
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ class Erelas:
         group=None,
         api_key=None,
         *,
+        environment=None,
         timeout=5,
         enabled=None,
         async_=None,
@@ -123,6 +125,7 @@ class Erelas:
         self._base_url = base_url
         self._group = group
         self._api_key = api_key
+        self._environment = environment
         self._enabled = enabled
         self._async = async_
         self.timeout = timeout
@@ -148,6 +151,15 @@ class Erelas:
     @group.setter
     def group(self, value):
         self._group = value
+
+    @property
+    def environment(self):
+        # Tags each ping with its environment (e.g. "production"); the server shows it on alerts.
+        return self._environment if self._environment is not None else _env("ERELAS_ENVIRONMENT")
+
+    @environment.setter
+    def environment(self, value):
+        self._environment = value
 
     @property
     def api_key(self):
@@ -236,6 +248,7 @@ class Erelas:
         message=None,
         period=None,
         grace=None,
+        environment=None,
         traceback=None,
     ):
         """Fire a single heartbeat ping. Best-effort: never raises."""
@@ -253,6 +266,10 @@ class Erelas:
             params["exit_code"] = exit_code
         if message:
             params["message"] = message[: self.message_maxlen]
+        # Environment tag — only sent when set; an unset env adds nothing to the ping.
+        env = environment if environment is not None else self.environment
+        if env:
+            params["env"] = env
 
         if key:
             # GUID endpoint — public, no API key. State goes in the path.
@@ -283,7 +300,7 @@ class Erelas:
 
     # -- wrappers -----------------------------------------------------------
     @contextmanager
-    def monitor(self, name=None, *, key=None, group=None, series=None, period=None, grace=None):
+    def monitor(self, name=None, *, key=None, group=None, series=None, period=None, grace=None, environment=None):
         """Context manager: emits start, then complete or fail with timing.
 
         ::
@@ -292,7 +309,8 @@ class Erelas:
                 do_work()
         """
         ident = dict(
-            key=key, name=name, group=group, series=series or uuid4().hex, period=period, grace=grace
+            key=key, name=name, group=group, series=series or uuid4().hex,
+            period=period, grace=grace, environment=environment,
         )
         started = time.monotonic()
         self.ping(START, **ident)
@@ -309,7 +327,7 @@ class Erelas:
             raise
         self.ping(OK, duration=time.monotonic() - started, **ident)
 
-    def job(self, name=None, *, key=None, group=None, series=None, period=None, grace=None):
+    def job(self, name=None, *, key=None, group=None, series=None, period=None, grace=None, environment=None):
         """Decorator, drop-in for ``@cronitor.job``. Place it innermost::
 
             @shared_task(...)
@@ -321,7 +339,8 @@ class Erelas:
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
-                with self.monitor(name, key=key, group=group, series=series, period=period, grace=grace):
+                with self.monitor(name, key=key, group=group, series=series,
+                                  period=period, grace=grace, environment=environment):
                     return func(*args, **kwargs)
 
             return wrapper

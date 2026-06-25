@@ -53,6 +53,7 @@ Env vars (or pass to `Erelas(...)`):
 | `ERELAS_BASE_URL` | `http://dev.erelas.lan` | server base URL |
 | `ERELAS_API_KEY` | — | required for group/name pings |
 | `ERELAS_DEFAULT_GROUP` | — | default group for name pings (override per-call with `group=`) |
+| `ERELAS_ENVIRONMENT` | — | environment tag shown on alerts, e.g. `config('ENV')` → `production` (omitted when unset) |
 | `ERELAS_ENABLED` | `true` | set false to no-op every ping |
 | `ERELAS_ASYNC` | `true` | set false to send synchronously (tests) |
 
