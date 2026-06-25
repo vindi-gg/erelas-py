@@ -32,9 +32,17 @@ Configuration (env vars, or pass to ``Erelas(...)``):
     ERELAS_BASE_URL   default http://dev.erelas.lan
     ERELAS_API_KEY    required for group/name pings (not for key= pings)
     ERELAS_DEFAULT_GROUP   default group for name pings; override per-call with group= (optional)
-    ERELAS_ENVIRONMENT     environment tag shown on alerts, e.g. config('ENV') -> "production" (optional)
+    ERELAS_ENVIRONMENT     environment tag (e.g. "production") shown on alerts; omitted when unset (optional)
     ERELAS_ENABLED    set false to no-op every ping (tests / off-dashboard runs)
     ERELAS_ASYNC      set false to send synchronously (simpler in tests)
+
+The environment tag resolves per call: explicit environment= argument -> instance value ->
+the ERELAS_ENVIRONMENT *OS* env var (os.environ, not your app's settings module). To reuse a
+value you already have in app config, set it on the client instead of adding a second env var::
+
+    from decouple import config
+    from erelas import erelas
+    erelas.environment = config("ENV")        # settings.py; or Erelas(environment=config("ENV"))
 """
 import atexit
 import functools

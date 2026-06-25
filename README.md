@@ -53,11 +53,36 @@ Env vars (or pass to `Erelas(...)`):
 | `ERELAS_BASE_URL` | `http://dev.erelas.lan` | server base URL |
 | `ERELAS_API_KEY` | — | required for group/name pings |
 | `ERELAS_DEFAULT_GROUP` | — | default group for name pings (override per-call with `group=`) |
-| `ERELAS_ENVIRONMENT` | — | environment tag shown on alerts, e.g. `config('ENV')` → `production` (omitted when unset) |
+| `ERELAS_ENVIRONMENT` | — | environment tag (e.g. `production`) shown on alerts; omitted when unset |
 | `ERELAS_ENABLED` | `true` | set false to no-op every ping |
 | `ERELAS_ASYNC` | `true` | set false to send synchronously (tests) |
 
 ```python
 from erelas import Erelas
 erelas = Erelas(base_url="https://erelas.example.com", group="pz", api_key="erl_...")
+```
+
+### Environment tag
+
+Each ping can carry an environment (`production`, `staging`, …) that the server shows on
+alerts. It's resolved per call: explicit `environment=` argument → instance value → the
+`ERELAS_ENVIRONMENT` OS env var. When none is set, nothing is sent.
+
+`ERELAS_ENVIRONMENT` is an **OS environment variable**, read from `os.environ` — not a setting
+in your app's config module. If you already have the value in app config (e.g. Django settings
+with `python-decouple`), set it on the client instead of adding a second env var:
+
+```python
+# settings.py — reuse your existing ENV, no redundant ERELAS_ENVIRONMENT needed
+from decouple import config
+from erelas import erelas
+
+erelas.environment = config("ENV")                       # or: config("ENV", default="development")
+```
+
+Per-call override (wins over both the instance value and the env var):
+
+```python
+with erelas.monitor("nightly-export", group="pz", environment="production"):
+    do_work()
 ```
