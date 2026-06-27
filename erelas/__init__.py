@@ -58,7 +58,7 @@ from uuid import uuid4
 
 import requests
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["Erelas", "erelas", "slugify", "START", "OK", "FAIL"]
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,11 @@ FAIL = "fail"
 _KEY_SUFFIX = {START: "start", OK: "", FAIL: "fail"}
 # ?state= value for the named endpoint (/m/<group>/<slug>).
 _NAMED_STATE = {START: "run", OK: "complete", FAIL: "fail"}
+
+# Delivery retry policy for the async pinger. A dropped completion ping orphans the
+# server-side run, so retry transient failures (network errors, timeouts, 5xx/429).
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF = (0.5, 1.5)  # seconds between attempts
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -207,17 +212,31 @@ class Erelas:
 
     def _http(self, url, params, headers, body):
         if body:
-            requests.post(url, params=params, data=body, headers=headers, timeout=self.timeout)
+            resp = requests.post(url, params=params, data=body, headers=headers, timeout=self.timeout)
         else:
-            requests.get(url, params=params, headers=headers, timeout=self.timeout)
+            resp = requests.get(url, params=params, headers=headers, timeout=self.timeout)
+        # Transient server errors are worth retrying; 4xx (bad key, etc.) are permanent.
+        if resp.status_code >= 500 or resp.status_code == 429:
+            raise RuntimeError("erelas server returned %d" % resp.status_code)
+
+    def _deliver(self, url, params, headers, body):
+        """Send one ping, retrying transient failures so a dropped completion ping
+        doesn't orphan the run. Runs on the daemon thread — never blocks the caller."""
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                self._http(url, params, headers, body)
+                return
+            except Exception as exc:  # never let a failed ping escape
+                if attempt + 1 >= _MAX_ATTEMPTS:
+                    logger.debug("erelas ping gave up url=%s after %d attempts: %s", url, _MAX_ATTEMPTS, exc)
+                    return
+                time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
 
     def _drain(self):
         while True:
             url, params, headers, body = self._queue.get()
             try:
-                self._http(url, params, headers, body)
-            except Exception as exc:  # never let a failed ping escape
-                logger.debug("erelas ping failed url=%s: %s", url, exc)
+                self._deliver(url, params, headers, body)
             finally:
                 self._queue.task_done()
 
@@ -236,10 +255,13 @@ class Erelas:
         except Exception as exc:  # enqueue must never break the caller
             logger.debug("erelas enqueue failed url=%s: %s", url, exc)
 
-    def flush(self, timeout=2.0):
-        """Best-effort drain of queued pings (used at exit / in tests)."""
+    def flush(self, timeout=5.0):
+        """Best-effort: wait until queued pings are actually *delivered* (used at exit /
+        in tests). Waits on unfinished_tasks — decremented only after a ping (and its
+        retries) completes — so a cron process doesn't exit mid-send and drop its
+        closing ping. Bounded by ``timeout`` since delivery is still best-effort."""
         deadline = time.monotonic() + timeout
-        while not self._queue.empty() and time.monotonic() < deadline:
+        while self._queue.unfinished_tasks and time.monotonic() < deadline:
             time.sleep(0.02)
 
     # -- pings --------------------------------------------------------------
