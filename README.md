@@ -34,6 +34,30 @@ erelas.ping(key="b8263...")                      # public GUID, no key needed
 erelas.ping(name="clear-sessions", group="pz")   # by name (needs ERELAS_API_KEY)
 ```
 
+## Step timings
+
+Wrap phases of a job in `erelas.step("name")` to record a per-phase breakdown. The
+timings ship on the finish ping and render as a waterfall on the run, so you can see
+*which* phase is slow — not just the total:
+
+```python
+@erelas.job("premium-sync", period="10m")
+def premium_sync():
+    with erelas.step("patreon-fetch"):
+        members = fetch_patreon()
+    with erelas.step("resolve-users"):
+        users = resolve(members)
+    with erelas.step("write-cache"):
+        cache.write(users)
+```
+
+`step()` finds the active run started by the enclosing `@erelas.job`/`monitor()` via a
+`ContextVar`, so it works even when the steps live in a different function (e.g. a Django
+management command the task calls). Outside a monitored run — or when the client is
+disabled — `step()` just runs the body, so it's safe to leave in place. Keep step names
+**stable and low-cardinality** (`"fetch-page"`, not `"fetch-page-3187"`); per-run names
+are capped (100 steps, 80 chars each) and defeat aggregation.
+
 ## Addressing a monitor
 
 | Mode | Pass | Endpoint | Auth |

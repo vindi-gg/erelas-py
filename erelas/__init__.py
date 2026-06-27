@@ -24,7 +24,10 @@ DNS unresolvable, timing out — every ping degrades to a silent no-op.
         ...
 
     with erelas.monitor("nightly-export", group="pz"):
-        do_work()
+        with erelas.step("extract"):       # per-phase timing -> waterfall on the dashboard
+            rows = extract()
+        with erelas.step("load"):
+            load(rows)
 
     erelas.ping(key="abc123")              # one-off success ping
 
@@ -46,6 +49,7 @@ value you already have in app config, set it on the client instead of adding a s
 """
 import atexit
 import functools
+import json
 import logging
 import os
 import queue
@@ -54,12 +58,13 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager
+from contextvars import ContextVar
 from uuid import uuid4
 
 import requests
 
-__version__ = "0.3.0"
-__all__ = ["Erelas", "erelas", "slugify", "START", "OK", "FAIL"]
+__version__ = "0.4.0"
+__all__ = ["Erelas", "erelas", "slugify", "step", "START", "OK", "FAIL"]
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,32 @@ _NAMED_STATE = {START: "run", OK: "complete", FAIL: "fail"}
 # server-side run, so retry transient failures (network errors, timeouts, 5xx/429).
 _MAX_ATTEMPTS = 3
 _RETRY_BACKOFF = (0.5, 1.5)  # seconds between attempts
+
+# Per-step timing. step() blocks append {name, ms} to the active run; the list ships
+# in the finish ping's POST body. Caps keep the payload bounded and nudge callers
+# toward stable, low-cardinality step names so the server can aggregate them.
+_STEP_NAME_MAXLEN = 80
+_MAX_STEPS = 100
+
+# The run currently being timed (set by monitor()/job()). Lets step() attach to it
+# without threading a handle through the call stack — e.g. from inside a Django
+# management command invoked by the decorated task. None outside a monitored run.
+_active_run = ContextVar("erelas_active_run", default=None)
+
+
+class _Run:
+    """Accumulates per-step timings for one monitored run."""
+
+    __slots__ = ("steps",)
+
+    def __init__(self):
+        self.steps = []
+
+    def add(self, name, seconds):
+        if len(self.steps) >= _MAX_STEPS:
+            return
+        self.steps.append({"name": str(name)[:_STEP_NAME_MAXLEN], "ms": int(round(seconds * 1000))})
+
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -280,6 +311,7 @@ class Erelas:
         grace=None,
         environment=None,
         traceback=None,
+        steps=None,
     ):
         """Fire a single heartbeat ping. Best-effort: never raises."""
         if not self.enabled:
@@ -287,7 +319,14 @@ class Erelas:
 
         params = {}
         headers = {}
-        body = {"traceback": traceback[:8000]} if traceback else None
+        # POST body (form-encoded). Traceback and per-step timings are too big / too
+        # structured for query params; steps go as a compact JSON string field.
+        body = {}
+        if traceback:
+            body["traceback"] = traceback[:8000]
+        if steps:
+            body["steps"] = json.dumps(steps, separators=(",", ":"))
+        body = body or None
         if series is not None:
             params["series"] = series
         if duration is not None:
@@ -333,29 +372,58 @@ class Erelas:
     def monitor(self, name=None, *, key=None, group=None, series=None, period=None, grace=None, environment=None):
         """Context manager: emits start, then complete or fail with timing.
 
-        ::
+        Time named sub-steps with ``step()`` to ship a per-phase breakdown
+        (rendered as a waterfall on the dashboard) on the finish ping::
 
             with erelas.monitor("nightly-export", group="pz"):
-                do_work()
+                with erelas.step("extract"):
+                    rows = extract()
+                with erelas.step("load"):
+                    load(rows)
         """
         ident = dict(
             key=key, name=name, group=group, series=series or uuid4().hex,
             period=period, grace=grace, environment=environment,
         )
+        run = _Run()
+        token = _active_run.set(run)
         started = time.monotonic()
         self.ping(START, **ident)
         try:
-            yield
+            yield run
         except BaseException as exc:
             self.ping(
                 FAIL,
                 duration=time.monotonic() - started,
                 message=describe_exc(exc),
                 traceback=traceback.format_exc(),
+                steps=run.steps or None,
                 **ident,
             )
             raise
-        self.ping(OK, duration=time.monotonic() - started, **ident)
+        finally:
+            _active_run.reset(token)
+        self.ping(OK, duration=time.monotonic() - started, steps=run.steps or None, **ident)
+
+    @contextmanager
+    def step(self, name):
+        """Time a named sub-step of the active monitored run.
+
+        Records ``{name, ms}`` against the run started by the enclosing
+        ``monitor()``/``job()``, which ships it on the finish ping. Outside a
+        monitored run (or when the client is disabled) it just runs the body, so
+        it's safe to leave in code that sometimes runs unmonitored::
+
+            with erelas.step("db-query"):
+                rows = run_query()
+        """
+        run = _active_run.get()
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            if run is not None and self.enabled:
+                run.add(name, time.monotonic() - started)
 
     def job(self, name=None, *, key=None, group=None, series=None, period=None, grace=None, environment=None):
         """Decorator, drop-in for ``@cronitor.job``. Place it innermost::
@@ -380,3 +448,6 @@ class Erelas:
 
 # Default shared instance — import and use directly, like the cronitor lib.
 erelas = Erelas()
+
+# Bare handle bound to the default instance, for `from erelas import step`.
+step = erelas.step
